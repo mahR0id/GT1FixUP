@@ -2,7 +2,7 @@
 
 See [CONTEXT.md](CONTEXT.md) for the hardware, the rules and the findings so far.
 
-**Important:** the current Claude session runs on the G15's Windows install. When the G15 boots macOS, that session is gone. Live debugging must be driven **from the XPS** (`mah@192.168.88.33`): either run Claude Code there, or SSH from another machine.
+**Important:** the current Claude session runs on the G15's Windows install. When the G15 boots macOS, that session is gone. Live debugging must be driven **from the XPS** (`<user>@<g15-ip>`): either run Claude Code there, or SSH from another machine.
 
 ## Phase 0: Prepare (before booting macOS on the G15)
 
