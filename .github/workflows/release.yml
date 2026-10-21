@@ -1,0 +1,49 @@
+# Build GT1URBFix.kext and publish it as a GitHub Release.
+# Runs when a tag is pushed (the tag name becomes the release name), or by hand
+# from the Actions tab with a tag name.
+name: Build and release
+
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        default: '1'
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The kext is built against Lilu's plugin SDK (DEBUG build) and MacKernelSDK.
+      - name: Fetch dependencies
+        run: |
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK deps/MacKernelSDK
+          mkdir deps/lilu
+          gh release download --repo acidanthera/Lilu --pattern '*DEBUG.zip' --dir deps/lilu
+          unzip -q deps/lilu/*.zip -d deps/lilu
+
+      - name: Build kext
+        run: |
+          MACKERNELSDK="$PWD/deps/MacKernelSDK" LILU_KEXT="$PWD/deps/lilu/Lilu.kext" sh GT1URBFix/build.sh
+          ditto -c -k --keepParent GT1URBFix/out/GT1URBFix.kext "GT1URBFix-$TAG.zip"
+          shasum -a 256 "GT1URBFix-$TAG.zip" | tee "GT1URBFix-$TAG.zip.sha256"
+
+      - name: Publish release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "GT1URBFix-$TAG.zip" "GT1URBFix-$TAG.zip.sha256" --clobber
+          else
+            gh release create "$TAG" "GT1URBFix-$TAG.zip" "GT1URBFix-$TAG.zip.sha256" \
+              --title "$TAG" --target "$GITHUB_SHA" \
+              --notes "GT1URBFix.kext, built by GitHub Actions. Add it to EFI/OC/Kexts after Lilu. See the README."
+          fi
