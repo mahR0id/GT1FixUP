@@ -1,0 +1,31 @@
+# Copy each "## <tag>" section of CHANGELOG.md into the GitHub release with that
+# tag. Runs whenever CHANGELOG.md changes on main, or by hand.
+name: Update release notes
+
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to edit releases
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Edit releases
+        run: |
+          for tag in $(grep -E '^## ' CHANGELOG.md | sed 's/^## //'); do
+            # Section text: from "## <tag>" up to the next "## " heading.
+            awk -v t="$tag" '$0 == "## " t {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --notes-file notes.md && echo "updated $tag"
+            else
+              echo "no release for $tag yet"
+            fi
+          done
