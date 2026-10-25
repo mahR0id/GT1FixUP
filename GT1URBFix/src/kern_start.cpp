@@ -21,6 +21,14 @@
 //  first instruction. Checked on macOS 15.7.9 and every stable 26.x KDK
 //  (26.0 to 26.7.2); there is no macOS version limit.
 //
+//  The Metal driver also keeps the GT2 URB size as constants in its own tables
+//  (3DSTATE_URB_VS payload 0x08030380 = 896 entries). The sku fix recomputes the
+//  common pipeline, but other pipeline configurations (used by Chrome, for
+//  example) still take these constants, so we patch them to 0x08030100 (256
+//  entries) as the driver's pages are loaded. The payload is a hardware command
+//  encoding, so the same bytes are expected on every macOS version; patterns
+//  that are not found do nothing.
+//
 //  Boot-args:
 //    -gt1urboff     disable the plugin
 //    -gt1urbdbg     debug logging (DEBUG builds of Lilu)
@@ -33,7 +41,55 @@
 
 #include <IOKit/IOService.h>
 #include <Headers/kern_api.hpp>
+#include <Headers/kern_user.hpp>
 #include <Headers/plugin_start.hpp>
+
+// ---------------------------------------------------------------------------
+// Part 1: URB constants in the Metal driver
+// ---------------------------------------------------------------------------
+
+// Each pair: stock bytes, replacement (only 0x0380 -> 0x0100 differs).
+struct UrbPatch { const char *name; uint8_t find[20]; uint8_t repl[20]; size_t len; };
+static const UrbPatch urbPatches[] {
+	// IGRenderStateURB::writeInit: movabsq $0x0803038078300000, %rcx
+	{"writeInit", {0x48,0xB9,0x00,0x00,0x30,0x78,0x80,0x03,0x03,0x08}, {0x48,0xB9,0x00,0x00,0x30,0x78,0x00,0x01,0x03,0x08}, 10},
+	// command template: URB_VS header + payload, then the URB_HS header
+	{"template",  {0x00,0x00,0x30,0x78,0x80,0x03,0x03,0x08,0x00,0x00,0x31,0x78}, {0x00,0x00,0x30,0x78,0x00,0x01,0x03,0x08,0x00,0x00,0x31,0x78}, 12},
+	// default VS/HS/DS/GS payloads
+	{"defaults",  {0x80,0x03,0x03,0x08,0,0,0,0x08,0,0,0,0x08,0,0,0,0x08}, {0x00,0x01,0x03,0x08,0,0,0,0x08,0,0,0,0x08,0,0,0,0x08}, 16},
+	// per-pipeline-config payloads (tessellation variant, HS/DS at 256 KB)
+	{"payloads",  {0x80,0x03,0x03,0x08,0,0,0,0,0,0,0,0x40,0,0,0,0,0,0,0,0x40}, {0x00,0x01,0x03,0x08,0,0,0,0,0,0,0,0x40,0,0,0,0,0,0,0,0x40}, 20},
+};
+
+static mach_vm_address_t orgCsValidatePage {};
+
+// Runs for every code page the kernel validates. After the original, patch the
+// URB constants in pages of the dyld shared cache or of an on-disk Intel driver.
+static void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t offset, const void *data, int *validated, int *tainted, int *nx) {
+	FunctionCast(csValidatePage, orgCsValidatePage)(vp, pager, offset, data, validated, tainted, nx);
+
+	char path[PATH_MAX];
+	int len = PATH_MAX;
+	if (vn_getpath(vp, path, &len) != 0)
+		return;
+	if (!UserPatcher::matchSharedCachePath(path) && !strstr(path, "AppleIntelKBLGraphics"))
+		return;
+
+	auto page = static_cast<uint8_t *>(const_cast<void *>(data));
+	for (auto &p : urbPatches) {
+		for (size_t i = 0; i + p.len <= PAGE_SIZE; i++) {
+			if (page[i] == p.find[0] && memcmp(page + i, p.find, p.len) == 0) {
+				memcpy(page + i, p.repl, p.len);
+				DBGLOG("gt1urb", "patched %s in %s", p.name, path);
+				i += p.len - 1;
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Part 2: kernel sku hook
+// ---------------------------------------------------------------------------
 
 static const char *kblPath[] { "/System/Library/Extensions/AppleIntelKBLGraphics.kext/Contents/MacOS/AppleIntelKBLGraphics" };
 static KernelPatcher::KextInfo kextKBL { "com.apple.driver.AppleIntelKBLGraphics", kblPath, arrsize(kblPath), {true}, {}, KernelPatcher::KextInfo::Unloaded };
@@ -176,6 +232,15 @@ PluginConfiguration ADDPR(config) {
 		setStatus(nullptr, "GT1URBFix-hook", "waiting for AppleIntelKBLGraphics");
 		lilu.onKextLoadForce(&kextKBL, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 			onKBLLoaded(patcher, index, address, size);
+		});
+		lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+			KernelPatcher::RouteRequest route("_cs_validate_page", csValidatePage, orgCsValidatePage);
+			if (patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1)) {
+				setStatus(nullptr, "GT1URBFix-urb-patches", "routed _cs_validate_page");
+			} else {
+				patcher.clearError();
+				setStatus(nullptr, "GT1URBFix-urb-patches", "failed to route _cs_validate_page");
+			}
 		});
 	}
 };
