@@ -17,24 +17,42 @@
 //  Measured: 384 entries (128 KB) is the last value that draws 100% of triangles;
 //  448 already drops some.
 //
-//  THE FIX
-//  Patch the driver code so it programs 256 entries (0x100: 32 KB..96 KB) instead
-//  of 896, and make the drivers' own "how big is the URB" helpers return the GT1
-//  size. There are several places that must all agree (see the tables below);
-//  missing any one leaves one pipeline configuration broken.
+//  THE FIX HAS TWO PARTS
 //
-//  HOW IT HOOKS IN
-//  The drivers live in the dyld shared cache, which cannot be edited on disk. So
-//  this plugin (built on Lilu) routes the kernel's _cs_validate_page, the function
-//  that code-signs each page as it is mapped, and patches the page bytes right
-//  after it is validated. This is the same technique RestrictEvents uses.
+//  A) Kernel hook (version independent, new in v2).
+//     The drivers only pick GT2 sizes because the kernel reports "sku 1" (GT2) for
+//     the spoofed id. IntelAccelerator::initHardwareCaps() in AppleIntelKBLGraphics
+//     reads the sku from the accelerator object and copies that row of the
+//     g_cSkuGlobals table (subslices, L3 banks, ...) into the hardware caps that
+//     user space reads. We wrap that function by its symbol name and, when the
+//     real PCI device-id is a Comet Lake GT1, set the sku to 0 first. The kernel
+//     then reports genuine GT1 caps and the drivers choose the GT1 URB themselves.
+//     The sku field offset is read from the function's own first instruction, so
+//     no per-version offsets are hard-coded. Checked identical on macOS 15.7.9 and
+//     every stable 26.x KDK from 26.0 to 26.7.2.
 //
-//  Boot-args: -gt1urboff disables the plugin, -gt1urbdbg enables debug logging,
-//  -gt1urbbeta allows loading on an unsupported macOS version.
+//  B) User-space byte patches (macOS 15 Sequoia drivers, from v1).
+//     Patch the driver code so it programs 256 entries (0x100: 32 KB..96 KB)
+//     instead of 896, and make the drivers' own "how big is the URB" helpers
+//     return the GT1 size. Several places must all agree (see the tables below).
+//     The drivers live in the dyld shared cache, which cannot be edited on disk,
+//     so we route the kernel's _cs_validate_page (which code-signs each page as
+//     it is mapped) and patch the bytes right after validation, the same
+//     technique RestrictEvents uses. Patterns that are not found do nothing.
+//
+//  Boot-args:
+//    -gt1urboff     disable the plugin
+//    -gt1urbdbg     debug logging (DEBUG builds of Lilu)
+//    -gt1urbnosku   disable part A (kernel sku hook)
+//    -gt1urbnouser  disable part B (user-space byte patches)
+//    -gt1urbforce   apply part A even if the real device-id is not a known GT1
+//
+//  There is no macOS version limit: the plugin loads on any version Lilu runs on.
 //
 
 #include <IOKit/IOService.h>
 #include <Headers/kern_api.hpp>
+#include <Headers/kern_iokit.hpp>
 #include <Headers/kern_user.hpp>
 #include <Headers/plugin_start.hpp>
 
@@ -97,13 +115,16 @@ static void replaceAll(void *data, vm_size_t size, const uint8_t *find, const ui
 
 // Replacement for the kernel's _cs_validate_page. Let the original run first (so
 // the page is validated and mapped), then, if the page belongs to the dyld shared
-// cache, apply all patches to the in-memory copy.
+// cache or to an on-disk Intel driver bundle (older macOS), apply all patches to
+// the in-memory copy.
 static void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
 	FunctionCast(csValidatePage, orgCsValidatePage)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
 
 	char path[PATH_MAX];
 	int pathlen = PATH_MAX;
-	if (vn_getpath(vp, path, &pathlen) != 0 || !UserPatcher::matchSharedCachePath(path))
+	if (vn_getpath(vp, path, &pathlen) != 0)
+		return;
+	if (!UserPatcher::matchSharedCachePath(path) && !strstr(path, "AppleIntelKBLGraphics"))
 		return;
 
 	auto page = const_cast<void *>(data);
@@ -115,8 +136,97 @@ static void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offs
 	replaceAll(page, PAGE_SIZE, findGLUrbSize, replGLUrbSize, sizeof(findGLUrbSize), "GL updateURBState", path);
 }
 
-// Lilu plugin boilerplate: boot-args and supported macOS range (Sequoia only,
-// since the byte patterns are specific to the 15.x drivers).
+// ---------------------------------------------------------------------------
+// Part A: kernel sku hook in AppleIntelKBLGraphics
+// ---------------------------------------------------------------------------
+
+static const char *kblPath[] { "/System/Library/Extensions/AppleIntelKBLGraphics.kext/Contents/MacOS/AppleIntelKBLGraphics" };
+static KernelPatcher::KextInfo kextKBL { "com.apple.driver.AppleIntelKBLGraphics", kblPath, arrsize(kblPath), {true}, {}, KernelPatcher::KextInfo::Unloaded };
+
+static constexpr const char *symInitHardwareCaps = "__ZN16IntelAccelerator16initHardwareCapsEv";
+
+// Original IntelAccelerator::initHardwareCaps, and the offset of the sku field
+// inside IntelAccelerator (0x10F8 in every build checked; found at runtime).
+static mach_vm_address_t orgInitHardwareCaps {};
+static uint32_t skuOffset {};
+static bool forceGT1 {};
+
+// Real (not spoofed) device-ids of Comet Lake GT1 iGPUs (Linux i915 CML_GT1 and CML_U_GT1).
+static bool isCometLakeGT1(uint32_t id) {
+	switch (id) {
+		case 0x9BA2: case 0x9BA4: case 0x9BA5: case 0x9BA8:   // CML-H/S GT1
+		case 0x9B21: case 0x9BAA: case 0x9BAC:                // CML-U GT1
+			return true;
+		default:
+			return false;
+	}
+}
+
+// Find the sku field offset from the start of initHardwareCaps, which begins by
+// loading it: mov r32, dword [rdi + disp32] (optional REX, opcode 8B, ModRM with
+// mod=10 and rm=rdi). Returns 0 if the instruction is not where we expect it.
+static uint32_t findSkuOffset(const uint8_t *code) {
+	for (size_t i = 0; i < 48; i++) {
+		size_t j = i;
+		if ((code[j] & 0xF0) == 0x40) {
+			if (code[j] & 0x01) continue;  // REX.B set: base is r15, not rdi
+			j++;
+		}
+		if (code[j] == 0x8B && (code[j + 1] & 0xC7) == 0x87) {
+			uint32_t disp;
+			memcpy(&disp, code + j + 2, sizeof(disp));
+			if (disp >= 0x100 && disp < 0x10000)
+				return disp;
+		}
+	}
+	return 0;
+}
+
+// Wrapper: on a GT1, make the accelerator's sku 0 before the original copies
+// the caps row for that sku. Returns what the original returns.
+static bool initHardwareCaps(void *that) {
+	auto accel = static_cast<IOService *>(that);
+	auto sku = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(that) + skuOffset);
+	auto pci = accel->getProvider();
+	uint32_t realId = pci ? WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) : 0;
+
+	if ((forceGT1 || isCometLakeGT1(realId)) && *sku != 0 && *sku < 4) {
+		SYSLOG("gt1urb", "real device-id 0x%04X, sku %u -> 0 (GT1 caps)", realId, *sku);
+		*sku = 0;
+	} else {
+		DBGLOG("gt1urb", "initHardwareCaps: real device-id 0x%04X, sku %u, not changed", realId, *sku);
+	}
+	return FunctionCast(initHardwareCaps, orgInitHardwareCaps)(that);
+}
+
+static void onKBLLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (index != kextKBL.loadIndex)
+		return;
+
+	auto fn = patcher.solveSymbol(index, symInitHardwareCaps, address, size);
+	if (!fn) {
+		SYSLOG("gt1urb", "%s not found, kernel sku hook disabled", symInitHardwareCaps);
+		patcher.clearError();
+		return;
+	}
+	skuOffset = findSkuOffset(reinterpret_cast<const uint8_t *>(fn));
+	if (!skuOffset) {
+		SYSLOG("gt1urb", "unexpected initHardwareCaps code, kernel sku hook disabled");
+		return;
+	}
+	SYSLOG("gt1urb", "sku field at IntelAccelerator+0x%X", skuOffset);
+
+	KernelPatcher::RouteRequest route(symInitHardwareCaps, initHardwareCaps, orgInitHardwareCaps);
+	if (!patcher.routeMultiple(index, &route, 1, address, size))
+		SYSLOG("gt1urb", "failed to route initHardwareCaps");
+	else
+		SYSLOG("gt1urb", "routed initHardwareCaps");
+}
+
+// ---------------------------------------------------------------------------
+// Lilu plugin boilerplate
+// ---------------------------------------------------------------------------
+
 static const char *bootargOff[]   { "-gt1urboff" };
 static const char *bootargDebug[] { "-gt1urbdbg" };
 static const char *bootargBeta[]  { "-gt1urbbeta" };
@@ -131,17 +241,29 @@ PluginConfiguration ADDPR(config) {
 	arrsize(bootargDebug),
 	bootargBeta,
 	arrsize(bootargBeta),
-	KernelVersion::Sequoia,
-	KernelVersion::Sequoia,
+	// No version limit: the oldest and newest values Lilu can express.
+	static_cast<KernelVersion>(0),
+	static_cast<KernelVersion>(255),
 	[]() {
 		SYSLOG("gt1urb", "GT1URBFix loaded");
-		// Once Lilu's kernel patcher is ready, route _cs_validate_page to ours.
-		lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
-			KernelPatcher::RouteRequest route("_cs_validate_page", csValidatePage, orgCsValidatePage);
-			if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1))
-				SYSLOG("gt1urb", "failed to route _cs_validate_page");
-			else
-				SYSLOG("gt1urb", "routed _cs_validate_page");
-		});
+		forceGT1 = checkKernelArgument("-gt1urbforce");
+
+		// Part A: wrap initHardwareCaps when AppleIntelKBLGraphics loads.
+		if (!checkKernelArgument("-gt1urbnosku")) {
+			lilu.onKextLoadForce(&kextKBL, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+				onKBLLoaded(patcher, index, address, size);
+			});
+		}
+
+		// Part B: once Lilu's kernel patcher is ready, route _cs_validate_page to ours.
+		if (!checkKernelArgument("-gt1urbnouser")) {
+			lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+				KernelPatcher::RouteRequest route("_cs_validate_page", csValidatePage, orgCsValidatePage);
+				if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1))
+					SYSLOG("gt1urb", "failed to route _cs_validate_page");
+				else
+					SYSLOG("gt1urb", "routed _cs_validate_page");
+			});
+		}
 	}
 };

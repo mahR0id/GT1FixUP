@@ -13,15 +13,34 @@ windows, missing text, flicker, no transparency effects.
 
 ## The fix: [GT1URBFix/](GT1URBFix/)
 
-A [Lilu](https://github.com/acidanthera/Lilu) plugin (kext). It hooks the kernel's
-`_cs_validate_page` and patches the Intel Metal/GL drivers inside the dyld shared
-cache as their pages are loaded, so they use a GT1-sized URB. The patches are
-explained in [GT1URBFix/src/kern_start.cpp](GT1URBFix/src/kern_start.cpp).
+A [Lilu](https://github.com/acidanthera/Lilu) plugin (kext) with two parts. Both
+are explained in [GT1URBFix/src/kern_start.cpp](GT1URBFix/src/kern_start.cpp).
 
-Boot-args: `-gt1urboff` disables it, `-gt1urbdbg` logs debug output,
-`-gt1urbbeta` loads it on an untested macOS version.
+1. **Kernel sku hook (v2, version independent).** The drivers only pick GT2 sizes
+   because the kernel reports sku 1 for the spoofed id. The plugin wraps
+   `IntelAccelerator::initHardwareCaps` in `AppleIntelKBLGraphics` by symbol name
+   and, when the real PCI device-id is a Comet Lake GT1, sets the sku to 0. The
+   kernel then reports genuine GT1 caps and the drivers size the URB themselves.
+   The field offset is read from the function's own code at runtime. The layout
+   was checked identical on macOS 15.7.9 and every stable 26.x KDK (26.0 to 26.7.2).
+2. **User-space byte patches (v1, macOS 15 drivers).** It hooks the kernel's
+   `_cs_validate_page` and patches the Intel Metal/GL drivers as their pages are
+   loaded, so they use a GT1-sized URB. Patterns that are not found do nothing.
 
-Tested on macOS 15.7.x (Darwin 24.6). Patterns are specific to those drivers.
+There is no macOS version limit.
+
+| Boot-arg | Effect |
+|---|---|
+| `-gt1urboff` | disable the plugin |
+| `-gt1urbdbg` | debug logging (with DEBUG Lilu) |
+| `-gt1urbnosku` | disable part 1 (kernel sku hook) |
+| `-gt1urbnouser` | disable part 2 (user-space byte patches) |
+| `-gt1urbforce` | apply part 1 even if the real device-id is not a known GT1 |
+
+**Status:** part 2 is tested on macOS 15.7.x (100% of triangles drawn). Part 1 is
+built but **not yet tested on hardware**. To test it on its own, boot with
+`-gt1urbnouser` and run the tests below; the kernel log should show
+`real device-id 0x9BA4, sku 1 -> 0 (GT1 caps)`.
 
 ### Build
 
