@@ -13,34 +13,26 @@ never drawn: broken windows, missing text, flicker, no transparency effects.
 
 ## The fix: [GT1URBFix/](GT1URBFix/)
 
-A small [Lilu](https://github.com/acidanthera/Lilu) plugin with two parts. The
-code is explained in [GT1URBFix/src/kern_start.cpp](GT1URBFix/src/kern_start.cpp).
+A small [Lilu](https://github.com/acidanthera/Lilu) plugin. As the Intel Metal
+and OpenGL drivers are loaded, it patches the six places where they size the URB
+for GT2, so they use the GT1 size (128 KB). The kernel and the hardware caps it
+reports are left untouched. The code is explained in
+[GT1URBFix/src/kern_start.cpp](GT1URBFix/src/kern_start.cpp).
 
-1. **Kernel sku hook.** It wraps `IntelAccelerator::initHardwareCaps` in
-   `AppleIntelKBLGraphics` (found by symbol name) and sets the sku to 0 when the
-   GPU's real device-id is a Comet Lake GT1. The kernel then reports genuine GT1
-   caps and the drivers size the URB for their main pipeline themselves.
-2. **URB constants.** The Metal driver also keeps the GT2 URB size (payload
-   `0x08030380`, 896 entries) in its own tables, used by other pipeline
-   configurations. Chrome hits those, so without this part Chrome is corrupted.
-   The plugin patches the four constants to 256 entries as the driver's pages
-   are loaded. The payload is a hardware command encoding, so the same bytes are
-   expected on every macOS version; patterns that are not found do nothing.
-
-- **No per-version code patches.** The field offset is read from the function's
-  own code at runtime. The layout is identical on macOS 15.7.9 and every stable 26.x
-  KDK (26.0 to 26.7.2), and there is no macOS version limit.
+- **Tested** on the Dell G15 5510:
+  - macOS 15.7.9: 100% of triangles drawn in Metal and OpenGL, Chrome normal.
+  - macOS 26.7.2 (Tahoe): all six patterns found and patched, no GPU hangs.
+- **No macOS version limit.** If a future macOS changes these bytes, the patches
+  simply don't apply (you see the old corruption, not a crash).
 - **Keep your iGPU settings.** The `device-id = C49B0000` spoof and the
   framebuffer properties are still needed; without the spoof the Intel driver
   does not load at all.
-- **Tested** on the G15 with macOS 15.7.9: 100% of triangles drawn in Metal and
-  OpenGL, Chrome renders normally. Not yet tested on macOS 26 or 10.15.
+- **Don't use `-igfxvesa`**: it turns graphics acceleration off completely.
 
 | Boot-arg | Effect |
 |---|---|
 | `-gt1urboff` | disable the plugin |
 | `-gt1urbdbg` | debug logging (with DEBUG Lilu) |
-| `-gt1urbforce` | apply the fix even if the real device-id is not a known GT1 |
 
 **Check that it works** (no root needed):
 
@@ -48,13 +40,13 @@ code is explained in [GT1URBFix/src/kern_start.cpp](GT1URBFix/src/kern_start.cpp
 ioreg -p IOService -n IOResources -l | grep GT1URBFix
 ```
 
-You should see `"GT1URBFix-hook" = "routed initHardwareCaps"`,
-`"GT1URBFix-urb-patches" = "routed _cs_validate_page"`,
-`"GT1URBFix-sku-before" = 1` and `"GT1URBFix-sku-after" = 0`.
+You should see `"GT1URBFix-urb-patches" = "routed _cs_validate_page"`. The
+`urb_patch_check` test below shows which patterns are patched in the running drivers.
 
-History: v1 patched six byte patterns in the Sequoia drivers. v2 added the kernel
-hook. v3.0 tried the hook alone, which broke Chrome. v3.1 keeps the hook plus the
-four URB constants, and drops the two code patches the hook makes unnecessary.
+**Why not a kernel fix?** v2 and v3 made the kernel report the GPU as a GT1
+(sku 0) instead of patching the drivers. That worked on macOS 15 but hung the GPU
+on macOS 26 (compute hangs in WindowServer, then a watchdog panic), so v4 went
+back to patching only the drivers. See [CHANGELOG.md](CHANGELOG.md).
 
 ### Build
 
@@ -81,7 +73,7 @@ run on the target machine. Set `GPU=NVIDIA` to pick another Metal device.
 | `gl_render_test` | OpenGL triangle coverage |
 | `metal_blend_aa_test` | blending, filtering, MSAA |
 | `metal_hwcaps_urb` | hardware caps and URB size the driver reports |
-| `urb_patch_check` | counts patched vs. stock URB patterns in the loaded drivers (v3.1: writeInit, template, defaults and payloads patched, urbsize stock) |
+| `urb_patch_check` | counts patched vs. stock URB patterns in the loaded Metal and OpenGL drivers (with v4 all six show `new`) |
 
 ## Notes
 

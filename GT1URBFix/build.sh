@@ -9,7 +9,7 @@ SDK=${MACKERNELSDK:-$HOME/g15dbg/build/MacKernelSDK}
 LILU=${LILU_KEXT:-$HOME/g15dbg/build/lilu_dl/Lilu.kext}/Contents/Resources
 OUT=$B/out; mkdir -p "$OUT/obj"
 CF="-target x86_64-apple-macos10.15 -mkernel -nostdinc -fno-builtin -fno-common -fno-stack-protector -mno-red-zone -msoft-float -O2 \
- -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DPRODUCT_NAME=GT1URBFix -DMODULE_VERSION=3.1.0 \
+ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DPRODUCT_NAME=GT1URBFix -DMODULE_VERSION=4.0.0 \
  -isystem $SDK/Headers -I$LILU -I$B/src"
 XF="-std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext -Wno-inconsistent-missing-override"
 clang   $CF -c "$B/src/kmod_info.c" -o "$OUT/obj/kmod_info.o"
